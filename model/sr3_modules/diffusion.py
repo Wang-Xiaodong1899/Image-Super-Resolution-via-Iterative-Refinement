@@ -122,7 +122,7 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer('sqrt_recip_alphas_cumprod',
                              to_torch(np.sqrt(1. / alphas_cumprod)))
         self.register_buffer('sqrt_recipm1_alphas_cumprod',
-                             to_torch(np.sqrt(1. / alphas_cumprod - 1)))
+                             to_torch(np.sqrt(1. / alphas_cumprod - 1)))##this cal noise_x_t to origin x
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         posterior_variance = betas * \
@@ -133,22 +133,30 @@ class GaussianDiffusion(nn.Module):
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
         self.register_buffer('posterior_log_variance_clipped', to_torch(
             np.log(np.maximum(posterior_variance, 1e-20))))
+        
         self.register_buffer('posterior_mean_coef1', to_torch(
             betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
         self.register_buffer('posterior_mean_coef2', to_torch(
             (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
+        ##above is eq 7 in DDPM
 
     def predict_start_from_noise(self, x_t, t, noise):
+        ##original diffusion model predict the noise,
+        ##here, x_t is the refine noise img, noise is the predicted noise
+        ##return the predict clean img
         return self.sqrt_recip_alphas_cumprod[t] * x_t - \
             self.sqrt_recipm1_alphas_cumprod[t] * noise
 
     def q_posterior(self, x_start, x_t, t):
+        ## follow is Eq.7 in DDPM, but the x_start is the reconstructed original img, x_t is the last noisy img
         posterior_mean = self.posterior_mean_coef1[t] * \
             x_start + self.posterior_mean_coef2[t] * x_t
         posterior_log_variance_clipped = self.posterior_log_variance_clipped[t]
+        ##return the mean and variance in Eq.6 in DDPM
         return posterior_mean, posterior_log_variance_clipped
 
     def p_mean_variance(self, x, t, clip_denoised: bool, condition_x=None):
+        # the x is the refine noise img, and t is the timestamp
         batch_size = x.shape[0]
         noise_level = torch.FloatTensor(
             [self.sqrt_alphas_cumprod_prev[t+1]]).repeat(batch_size, 1).to(x.device)
@@ -158,29 +166,35 @@ class GaussianDiffusion(nn.Module):
         else:
             x_recon = self.predict_start_from_noise(
                 x, t=t, noise=self.denoise_fn(x, noise_level))
+        ##denoise_fn is the model
 
         if clip_denoised:
             x_recon.clamp_(-1., 1.)
-
+        # x_recon is clean img, x is the last step noise img
         model_mean, posterior_log_variance = self.q_posterior(
             x_start=x_recon, x_t=x, t=t)
+        ##estimated mean and variance in the t timestep
         return model_mean, posterior_log_variance
 
     @torch.no_grad()
     def p_sample(self, x, t, clip_denoised=True, condition_x=None):
+        ##x is the refine noise img, t is the t
         model_mean, model_log_variance = self.p_mean_variance(
             x=x, t=t, clip_denoised=clip_denoised, condition_x=condition_x)
-        noise = torch.randn_like(x) if t > 0 else torch.zeros_like(x)
+        noise = torch.randn_like(x) if t > 0 else torch.zeros_like(x)   #noise=0 if t==0
         return model_mean + noise * (0.5 * model_log_variance).exp()
 
     @torch.no_grad()
     def p_sample_loop(self, x_in, continous=False):
         device = self.betas.device
         sample_inter = (1 | (self.num_timesteps//10))
+        ## random generate a high-resolution image
         if not self.conditional:
             shape = x_in
             img = torch.randn(shape, device=device)
-            ret_img = img
+            ret_img = img   ##init is the random 
+            ##sampling T steps
+            ##note the img is pure noise at first
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
                 img = self.p_sample(img, i)
                 if i % sample_inter == 0:
@@ -189,7 +203,7 @@ class GaussianDiffusion(nn.Module):
             x = x_in
             shape = x.shape
             img = torch.randn(shape, device=device)
-            ret_img = x
+            ret_img = x ##init is the small resolution
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
                 img = self.p_sample(img, i, condition_x=x)
                 if i % sample_inter == 0:
@@ -212,16 +226,17 @@ class GaussianDiffusion(nn.Module):
     def q_sample(self, x_start, continuous_sqrt_alpha_cumprod, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        # random gama
+        # random gama, related the Eq.(4) in DDPM
         return (
             continuous_sqrt_alpha_cumprod * x_start +
             (1 - continuous_sqrt_alpha_cumprod**2).sqrt() * noise
         )
 
     def p_losses(self, x_in, noise=None):
-        x_start = x_in['HR']
+        x_start = x_in['HR']##high resolution
         [b, c, h, w] = x_start.shape
         t = np.random.randint(1, self.num_timesteps + 1)
+        ## t give the random time to the x_start, and the noise is the pure guassian noise.
         continuous_sqrt_alpha_cumprod = torch.FloatTensor(
             np.random.uniform(
                 self.sqrt_alphas_cumprod_prev[t-1],
@@ -232,10 +247,11 @@ class GaussianDiffusion(nn.Module):
         continuous_sqrt_alpha_cumprod = continuous_sqrt_alpha_cumprod.view(
             b, -1)
 
-        noise = default(noise, lambda: torch.randn_like(x_start))
+        noise = default(noise, lambda: torch.randn_like(x_start))##pure guassian noise
         x_noisy = self.q_sample(
             x_start=x_start, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), noise=noise)
 
+        #whether to high resolution given the low resolution
         if not self.conditional:
             x_recon = self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod)
         else:
